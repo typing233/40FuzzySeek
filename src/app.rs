@@ -315,10 +315,10 @@ impl App {
             indices.sort_unstable();
             indices
                 .iter()
-                .filter_map(|&i| store.get(i).map(|s| s.to_string()))
+                .filter_map(|&i| store.get_output_text(i).map(|s| s.to_string()))
                 .collect()
         } else if let Some(result) = ms.results.get(self.state.cursor_pos) {
-            if let Some(line) = store.get(result.index) {
+            if let Some(line) = store.get_output_text(result.index) {
                 vec![line.to_string()]
             } else {
                 vec![]

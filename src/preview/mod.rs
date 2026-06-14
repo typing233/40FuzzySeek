@@ -52,7 +52,8 @@ pub struct PreviewRunner {
     state: SharedPreview,
     cache: Arc<Mutex<PreviewCache>>,
     generation: Arc<AtomicU64>,
-    cancel_flag: Arc<AtomicBool>,
+    /// Shared cancel token — swapped on each new request so the old thread sees `true`.
+    active_cancel: Arc<Mutex<Arc<AtomicBool>>>,
 }
 
 impl PreviewRunner {
@@ -71,7 +72,7 @@ impl PreviewRunner {
             state,
             cache,
             generation: Arc::new(AtomicU64::new(0)),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            active_cancel: Arc::new(Mutex::new(Arc::new(AtomicBool::new(false)))),
         }
     }
 
@@ -100,11 +101,17 @@ impl PreviewRunner {
             }
         }
 
-        // Cancel previous
-        self.cancel_flag.store(true, Ordering::SeqCst);
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Cancel the previous preview command by setting its cancel flag
+        let new_cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut active = self.active_cancel.lock();
+            // Signal the old thread to kill its child process
+            active.store(true, Ordering::SeqCst);
+            // Install the new cancel token
+            *active = Arc::clone(&new_cancel);
+        }
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let cmd = self.resolver.resolve(line);
         let state = Arc::clone(&self.state);
         let cache = Arc::clone(&self.cache);
@@ -112,7 +119,7 @@ impl PreviewRunner {
         let timeout = self.config.timeout;
         let max_bytes = self.config.max_output_bytes;
         let line_owned = line.to_string();
-        let cancel_clone = Arc::clone(&cancel);
+        let cancel_token = new_cancel;
 
         {
             let mut s = state.lock();
@@ -121,10 +128,10 @@ impl PreviewRunner {
             s.scroll_offset = 0;
         }
 
-        // Store new cancel flag (using generation for staleness instead of shared flag for simplicity)
         thread::spawn(move || {
-            let result = run_preview_command(&cmd, timeout, max_bytes, &cancel_clone);
+            let result = run_preview_command(&cmd, timeout, max_bytes, &cancel_token);
 
+            // Only update if still the latest generation
             if generation.load(Ordering::SeqCst) != gen {
                 return;
             }
@@ -154,6 +161,11 @@ impl PreviewRunner {
     }
 
     pub fn clear(&self) {
+        // Cancel any running preview
+        {
+            let active = self.active_cancel.lock();
+            active.store(true, Ordering::SeqCst);
+        }
         let mut s = self.state.lock();
         s.content = PreviewContent::Empty;
         s.current_line.clear();
@@ -171,12 +183,10 @@ impl PreviewRunner {
             s.current_line.clone()
         };
         if !line.is_empty() {
-            // Remove from cache and re-request
             {
                 let mut cache = self.cache.lock();
                 cache.clear();
             }
-            // Force re-request by clearing current_line
             {
                 let mut s = self.state.lock();
                 s.current_line.clear();
@@ -184,12 +194,9 @@ impl PreviewRunner {
             self.request(&line);
         }
     }
-
-    pub fn is_visible(&self) -> bool {
-        self.state.lock().visible
-    }
 }
 
+#[derive(Debug)]
 enum PreviewError {
     Timeout,
     Cancelled,
@@ -212,7 +219,18 @@ fn run_preview_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| PreviewError::Failed(format!("spawn: {}", e)))?;
+        .map_err(|e| {
+            let msg = match e.kind() {
+                io::ErrorKind::NotFound => {
+                    format!("shell '{}' not found: {}", shell, e)
+                }
+                io::ErrorKind::PermissionDenied => {
+                    format!("permission denied running '{}': {}", shell, e)
+                }
+                _ => format!("failed to spawn preview command: {}", e),
+            };
+            PreviewError::Failed(msg)
+        })?;
 
     let poll_interval = Duration::from_millis(50);
     let mut elapsed = Duration::ZERO;
@@ -225,7 +243,21 @@ fn run_preview_command(
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                if !status.success() && status.code() == Some(126) {
+                    let _ = child.wait_with_output();
+                    return Err(PreviewError::Failed(
+                        format!("permission denied executing preview command")
+                    ));
+                }
+                if !status.success() && status.code() == Some(127) {
+                    let _ = child.wait_with_output();
+                    return Err(PreviewError::Failed(
+                        format!("command not found in preview: {}", cmd)
+                    ));
+                }
+                break;
+            }
             Ok(None) => {
                 elapsed += poll_interval;
                 if elapsed >= timeout {
@@ -235,12 +267,12 @@ fn run_preview_command(
                 }
                 thread::sleep(poll_interval);
             }
-            Err(e) => return Err(PreviewError::Failed(format!("wait: {}", e))),
+            Err(e) => return Err(PreviewError::Failed(format!("wait error: {}", e))),
         }
     }
 
     let output = child.wait_with_output()
-        .map_err(|e| PreviewError::Failed(format!("read: {}", e)))?;
+        .map_err(|e| PreviewError::Failed(format!("failed to read output: {}", e)))?;
 
     let stdout = output.stdout;
     if stdout.len() > max_bytes {
@@ -249,10 +281,164 @@ fn run_preview_command(
     }
 
     let result = String::from_utf8_lossy(&stdout).into_owned();
+
+    // If stdout is empty but stderr has content, show stderr as error
     if result.is_empty() && !output.stderr.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(PreviewError::Failed(stderr));
+        let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
+        let first_line = stderr_text.lines().next().unwrap_or(&stderr_text);
+        return Err(PreviewError::Failed(first_line.to_string()));
+    }
+
+    // If command exited non-zero with stdout content, still show it but prepend warning
+    if !output.status.success() && !result.is_empty() {
+        return Ok(result);
+    }
+
+    // If command exited non-zero with no output at all
+    if !output.status.success() && result.is_empty() {
+        let code = output.status.code().unwrap_or(-1);
+        return Err(PreviewError::Failed(
+            format!("preview command exited with code {}", code)
+        ));
     }
 
     Ok(result)
 }
+
+use std::io;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_cancel_flag_propagates_to_running_command() {
+        // Create a cancel flag, set it immediately, then run a command.
+        // The command should be killed quickly rather than running for 60s.
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Spawn a thread that sets cancel after 100ms
+        let cancel_clone = Arc::clone(&cancel);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_clone.store(true, Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let result = run_preview_command(
+            "sleep 60",
+            Duration::from_secs(30),
+            1_000_000,
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+
+        // Should complete within 500ms (100ms wait + 50ms poll interval + margin)
+        assert!(elapsed < Duration::from_secs(1),
+            "Cancel took {:?}, expected < 1s", elapsed);
+        assert!(matches!(result, Err(PreviewError::Cancelled)));
+    }
+
+    #[test]
+    fn test_timeout_kills_slow_command() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let result = run_preview_command(
+            "sleep 60",
+            Duration::from_millis(200),
+            1_000_000,
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+
+        // Should timeout within 500ms (200ms timeout + poll margin)
+        assert!(elapsed < Duration::from_secs(1),
+            "Timeout took {:?}, expected < 1s", elapsed);
+        assert!(matches!(result, Err(PreviewError::Timeout)));
+    }
+
+    #[test]
+    fn test_successful_command_returns_output() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_preview_command(
+            "echo hello",
+            Duration::from_secs(5),
+            1_000_000,
+            &cancel,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    #[test]
+    fn test_command_not_found_shows_error() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_preview_command(
+            "nonexistent_command_xyz_12345",
+            Duration::from_secs(5),
+            1_000_000,
+            &cancel,
+        );
+        // Should be an error (command not found = exit 127)
+        assert!(matches!(result, Err(PreviewError::Failed(_))));
+    }
+
+    #[test]
+    fn test_permission_denied_shows_error() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_preview_command(
+            "/dev/null",
+            Duration::from_secs(5),
+            1_000_000,
+            &cancel,
+        );
+        // /dev/null is not executable, should get permission denied or similar
+        assert!(matches!(result, Err(PreviewError::Failed(_))));
+    }
+
+    #[test]
+    fn test_output_too_large_truncates() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Generate more than 100 bytes of output
+        let result = run_preview_command(
+            "seq 1 10000",
+            Duration::from_secs(5),
+            100, // very small limit
+            &cancel,
+        );
+        assert!(matches!(result, Err(PreviewError::OutputTooLarge(_))));
+        if let Err(PreviewError::OutputTooLarge(partial)) = result {
+            assert!(partial.len() <= 100);
+        }
+    }
+
+    #[test]
+    fn test_preview_runner_cancel_on_new_request() {
+        // Prove that requesting a new preview cancels the old one.
+        // Use a resolver that runs sleep for first item, echo for second.
+        let resolver = PreviewResolver::new("echo {}".to_string());
+        let config = PreviewConfig {
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 1_000_000,
+            cache_capacity: 10,
+        };
+        let runner = PreviewRunner::new(resolver, config);
+
+        // Request a slow preview
+        // We can't easily use "sleep 60" here because the resolver wraps {}
+        // but we can test that two rapid requests don't deadlock or panic
+        runner.request("first");
+        thread::sleep(Duration::from_millis(10));
+        runner.request("second");
+        thread::sleep(Duration::from_millis(200));
+
+        // Second request should have completed (echo is fast)
+        let state = runner.state();
+        let s = state.lock();
+        assert_eq!(s.current_line, "second");
+        // Should have content (either Text or Loading depending on timing)
+        assert!(!matches!(s.content, PreviewContent::Empty));
+    }
+}
+

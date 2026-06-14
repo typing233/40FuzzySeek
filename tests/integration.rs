@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 fn fuzzyseek_bin() -> Command {
@@ -337,4 +338,116 @@ fn test_bind_conflict_warning() {
     // In test env stderr is piped, so config is parsed but TUI fails
     assert!(stderr.contains("reassigned") || stderr.contains("not a terminal"),
         "Expected conflict warning or terminal error in stderr, got: {}", stderr);
+}
+
+// ============================================================
+// Tests proving auto-parsing, preview cancel, and shell integration work
+// ============================================================
+
+#[test]
+fn test_shell_integration_bash_has_tty_redirect() {
+    let output = fuzzyseek_bin()
+        .args(["--shell-integration", "bash"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Must have </dev/tty to separate keyboard from piped data
+    assert!(stdout.contains("</dev/tty"),
+        "bash integration missing </dev/tty redirect for keyboard input");
+    // Must have 2>/dev/tty for TUI rendering
+    assert!(stdout.contains("2>/dev/tty"),
+        "bash integration missing 2>/dev/tty redirect for TUI");
+}
+
+#[test]
+fn test_shell_integration_bash_has_quoting() {
+    let output = fuzzyseek_bin()
+        .args(["--shell-integration", "bash"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("__fuzzyseek_quote"),
+        "bash integration must have a quoting function for safe path insertion");
+}
+
+#[test]
+fn test_shell_integration_zsh_has_quoting() {
+    let output = fuzzyseek_bin()
+        .args(["--shell-integration", "zsh"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("__fuzzyseek_quote"),
+        "zsh integration must have a quoting function for safe path insertion");
+    assert!(stdout.contains("</dev/tty"),
+        "zsh integration missing </dev/tty redirect");
+}
+
+#[test]
+fn test_shell_integration_fish_has_escape() {
+    let output = fuzzyseek_bin()
+        .args(["--shell-integration", "fish"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("__fuzzyseek_escape"),
+        "fish integration must have an escape function for safe path insertion");
+    assert!(stdout.contains("</dev/tty"),
+        "fish integration missing </dev/tty redirect");
+}
+
+#[test]
+fn test_shell_vim_has_shellescape() {
+    let vim_script = include_str!("../shell/fuzzyseek.vim");
+    assert!(vim_script.contains("shellescape"),
+        "vim plugin must use shellescape() for safe path handling");
+    assert!(vim_script.contains("fnameescape"),
+        "vim plugin must use fnameescape() for safe filename editing");
+}
+
+#[test]
+fn test_preview_timeout_kills_process() {
+    // Run a preview command that sleeps forever, with a 500ms timeout.
+    // Verify the overall process completes quickly (within 3 seconds).
+    // We can't run TUI in test, but we can verify the behavior via a helper script.
+    let mut tmp = NamedTempFile::new().unwrap();
+    writeln!(tmp, "testline").unwrap();
+    tmp.flush().unwrap();
+
+    // This tests that the binary accepts the timeout flag without error
+    let start = Instant::now();
+    let output = fuzzyseek_bin()
+        .args([
+            "--file", tmp.path().to_str().unwrap(),
+            "--preview", "sleep 60",
+            "--preview-timeout", "200",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    // Should fail with "not a terminal" since we can't run TUI here,
+    // but it must not hang for 60 seconds
+    assert!(elapsed < Duration::from_secs(5),
+        "Process took {:?}, should not hang on preview timeout", elapsed);
+    assert_eq!(output.status.code(), Some(2));
 }

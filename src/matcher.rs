@@ -128,7 +128,8 @@ impl FuzzyMatcher {
                         thread::sleep(std::time::Duration::from_millis(30));
                         continue;
                     }
-                    items = s.get_range(offset, end);
+                    // Use search_text for matching (parsed command/filename if parser active)
+                    items = s.get_search_range(offset, end);
                 }
 
                 let batch_len = items.len();
