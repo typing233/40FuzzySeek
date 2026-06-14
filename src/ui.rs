@@ -1,8 +1,9 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::AppState;
 use crate::matcher::MatchResult;
@@ -10,7 +11,7 @@ use crate::matcher::MatchResult;
 pub fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    let main_chunks = if state.preview_cmd.is_some() {
+    let main_chunks = if state.has_preview() {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -32,7 +33,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     draw_list(f, state, left_chunks[1]);
     draw_status(f, state, left_chunks[2]);
 
-    if state.preview_cmd.is_some() && main_chunks.len() > 1 {
+    if state.has_preview() && main_chunks.len() > 1 {
         draw_preview(f, state, main_chunks[1]);
     }
 }
@@ -42,28 +43,29 @@ fn draw_input(f: &mut Frame, state: &AppState, area: Rect) {
         .borders(Borders::ALL)
         .title(" Query ");
 
-    let cursor_suffix = if state.query.is_empty() { "" } else { "" };
-    let input_text = format!("{}{}", state.query, cursor_suffix);
-    let input = Paragraph::new(input_text)
+    let input = Paragraph::new(state.query.as_str())
         .block(input_block)
         .style(Style::default().fg(Color::White));
 
     f.render_widget(input, area);
 
-    let cursor_x = area.x + 1 + state.query.len() as u16;
+    // Use unicode display width for correct cursor positioning with CJK chars
+    let visual_width = UnicodeWidthStr::width(state.query.as_str()) as u16;
+    let cursor_x = area.x + 1 + visual_width;
     let cursor_y = area.y + 1;
-    f.set_cursor_position((cursor_x, cursor_y));
+    f.set_cursor_position((cursor_x.min(area.x + area.width - 2), cursor_y));
 }
 
 fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
     let visible_height = area.height as usize;
-    let match_state = state.match_state.lock();
+    let match_state = state.match_state.read();
     let results = &match_state.results;
 
     let total = results.len();
     let start = state.scroll_offset;
     let end = (start + visible_height).min(total);
 
+    let store = state.store.read();
     let items: Vec<ListItem> = results[start..end]
         .iter()
         .enumerate()
@@ -72,17 +74,14 @@ fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
             let is_cursor = abs_idx == state.cursor_pos;
             let is_selected = state.selected.contains(&m.index);
 
-            let line_text = state
-                .store
-                .lock()
-                .get(m.index)
-                .unwrap_or("")
-                .to_string();
+            let line_text = store.get(m.index).map(|s| s.as_ref()).unwrap_or("");
 
-            let spans = build_highlighted_spans_owned(&line_text, m, is_cursor, is_selected, state.multi_select);
+            let spans = build_highlighted_line(line_text, m, is_cursor, is_selected, state.multi_select);
             ListItem::new(Line::from(spans))
         })
         .collect();
+    drop(store);
+    drop(match_state);
 
     let list = List::new(items);
     f.render_widget(Clear, area);
@@ -90,25 +89,17 @@ fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let match_state = state.match_state.lock();
-    let store = state.store.lock();
+    let match_state = state.match_state.read();
+    let store = state.store.read();
 
     let status = if match_state.is_complete {
-        format!(
-            " {}/{} ",
-            match_state.results.len(),
-            store.len()
-        )
+        format!(" {}/{} ", match_state.results.len(), store.len())
     } else {
-        format!(
-            " {}/{}  (scanning...) ",
-            match_state.results.len(),
-            store.len()
-        )
+        format!(" {}/{}  (scanning...) ", match_state.results.len(), store.len())
     };
 
     let multi_hint = if state.multi_select {
-        format!(" [{}  selected] ", state.selected.len())
+        format!(" [{} selected] ", state.selected.len())
     } else {
         String::new()
     };
@@ -124,16 +115,22 @@ fn draw_preview(f: &mut Frame, state: &AppState, area: Rect) {
         .borders(Borders::ALL)
         .title(" Preview ");
 
-    let content = &state.preview_content;
-    let paragraph = Paragraph::new(content.as_str())
+    let (content, loading) = state.get_preview_content();
+    let display = if loading { "Loading...".to_string() } else { content };
+
+    let paragraph = Paragraph::new(display)
         .block(preview_block)
+        .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::White));
 
     f.render_widget(paragraph, area);
 }
 
-fn build_highlighted_spans_owned(
-    text: &str,
+/// Build highlighted spans from a candidate line.
+/// ANSI codes are stripped before indexing/highlighting to avoid layout corruption.
+/// Characters are indexed after stripping so highlight positions stay correct.
+fn build_highlighted_line(
+    raw_text: &str,
     match_result: &MatchResult,
     is_cursor: bool,
     is_selected: bool,
@@ -143,8 +140,10 @@ fn build_highlighted_spans_owned(
 
     let prefix = if multi_select {
         if is_selected { "● " } else { "  " }
+    } else if is_cursor {
+        "> "
     } else {
-        if is_cursor { "> " } else { "  " }
+        "  "
     };
 
     let prefix_style = if is_cursor {
@@ -156,6 +155,10 @@ fn build_highlighted_spans_owned(
     };
 
     spans.push(Span::styled(prefix.to_string(), prefix_style));
+
+    // Strip ANSI escapes for safe character indexing
+    let stripped_bytes = strip_ansi_escapes::strip(raw_text);
+    let stripped = String::from_utf8_lossy(&stripped_bytes);
 
     let highlight_set: std::collections::HashSet<u32> =
         match_result.positions.iter().copied().collect();
@@ -174,15 +177,11 @@ fn build_highlighted_spans_owned(
     let mut current_run = String::new();
     let mut current_is_highlight = false;
 
-    for ch in text.chars() {
+    for ch in stripped.chars() {
         let is_hl = highlight_set.contains(&char_idx);
 
         if is_hl != current_is_highlight && !current_run.is_empty() {
-            let style = if current_is_highlight {
-                highlight_style
-            } else {
-                base_style
-            };
+            let style = if current_is_highlight { highlight_style } else { base_style };
             spans.push(Span::styled(std::mem::take(&mut current_run), style));
         }
 
@@ -192,11 +191,7 @@ fn build_highlighted_spans_owned(
     }
 
     if !current_run.is_empty() {
-        let style = if current_is_highlight {
-            highlight_style
-        } else {
-            base_style
-        };
+        let style = if current_is_highlight { highlight_style } else { base_style };
         spans.push(Span::styled(current_run, style));
     }
 

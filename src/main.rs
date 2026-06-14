@@ -1,7 +1,9 @@
 mod app;
 mod config;
 mod input;
+mod keybind;
 mod matcher;
+mod preview;
 mod ui;
 
 use std::io::{self, IsTerminal, Write};
@@ -9,12 +11,15 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use crossterm::{
+    cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use app::App;
 use config::Config;
@@ -45,13 +50,27 @@ struct Cli {
     /// Custom delimiter for output (default: newline)
     #[arg(short, long, default_value = "\n")]
     delimiter: String,
+
+    /// Key bindings (format: action:key, e.g. "confirm:ctrl-m,cancel:ctrl-g")
+    #[arg(long)]
+    bind: Vec<String>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = Config::from_cli(&cli);
+    let config = match Config::from_cli(&cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fuzzyseek: {}", e);
+            return ExitCode::from(2);
+        }
+    };
 
     let input_source = if let Some(ref path) = cli.file {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("fuzzyseek: cannot open '{}': No such file or directory", path);
+            return ExitCode::from(2);
+        }
         input::InputSource::File(path.clone())
     } else if !io::stdin().is_terminal() {
         input::InputSource::Stdin
@@ -60,26 +79,70 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let stderr = io::stderr();
-    let backend = CrosstermBackend::new(stderr.lock());
+    let is_inline = config.height > 0;
+    let inline_height = config.height;
 
-    enable_raw_mode().expect("failed to enable raw mode");
     let mut stderr_handle = io::stderr();
-    execute!(stderr_handle, EnterAlternateScreen, EnableMouseCapture)
-        .expect("failed to enter alternate screen");
+    if !stderr_handle.is_terminal() {
+        eprintln!("fuzzyseek: stderr is not a terminal, cannot display TUI");
+        return ExitCode::from(2);
+    }
 
-    let mut terminal = Terminal::new(backend).expect("failed to create terminal");
+    if let Err(e) = enable_raw_mode() {
+        eprintln!("fuzzyseek: failed to enable raw mode: {}", e);
+        return ExitCode::from(2);
+    }
+
+    if !is_inline {
+        if let Err(e) = execute!(stderr_handle, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            eprintln!("fuzzyseek: failed to initialize terminal: {}", e);
+            return ExitCode::from(2);
+        }
+    } else {
+        let _ = execute!(stderr_handle, EnableMouseCapture);
+    }
+
+    let backend = CrosstermBackend::new(io::stderr());
+    let terminal = if is_inline {
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(inline_height),
+            },
+        )
+    } else {
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+    };
+
+    let mut terminal = match terminal {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = disable_raw_mode();
+            if !is_inline {
+                let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
+            }
+            eprintln!("fuzzyseek: failed to create terminal: {}", e);
+            return ExitCode::from(2);
+        }
+    };
 
     let mut app = App::new(config, input_source);
     let result = app.run(&mut terminal);
 
-    disable_raw_mode().expect("failed to disable raw mode");
-    execute!(
-        io::stderr(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .expect("failed to leave alternate screen");
+    let _ = disable_raw_mode();
+    if is_inline {
+        let _ = execute!(io::stderr(), DisableMouseCapture, cursor::Show);
+        // Insert newline to move below the inline viewport
+        let _ = execute!(io::stderr(), cursor::MoveToNextLine(1));
+    } else {
+        let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
+    }
 
     match result {
         Ok(Some(selections)) => {
