@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

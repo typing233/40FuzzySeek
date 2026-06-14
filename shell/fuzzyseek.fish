@@ -23,11 +23,11 @@ end
 # --- Ctrl+R: History search ---
 function __fuzzyseek_history
     set -l query (commandline)
-    # Pipe history to fuzzyseek; redirect stderr to tty for rendering,
-    # redirect stdin from tty so fuzzyseek gets keyboard input
+    # Pipe history to fuzzyseek; stderr goes to tty for TUI rendering.
+    # Keyboard input is read from /dev/tty internally by crossterm.
     set -l output (
         builtin history |
-        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS --query "$query" 2>/dev/tty </dev/tty
+        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS --query "$query" 2>/dev/tty
     )
     if test $status -eq 0; and test -n "$output"
         commandline -r -- "$output"
@@ -39,7 +39,7 @@ end
 function __fuzzyseek_file
     set -l output (
         eval $FUZZYSEEK_CTRL_T_COMMAND |
-        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS --multi 2>/dev/tty </dev/tty
+        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS --multi 2>/dev/tty
     )
     if test $status -eq 0; and test -n "$output"
         # Properly quote each selected item and join with spaces
@@ -56,7 +56,7 @@ end
 function __fuzzyseek_cd
     set -l output (
         eval $FUZZYSEEK_ALT_C_COMMAND |
-        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS 2>/dev/tty </dev/tty
+        command $FUZZYSEEK_CMD $FUZZYSEEK_DEFAULT_OPTS 2>/dev/tty
     )
     if test -n "$output"
         cd -- "$output"

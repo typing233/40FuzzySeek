@@ -15,10 +15,10 @@ __FUZZYSEEK_ZSH_LOADED=1
 : "${FUZZYSEEK_ALT_C_COMMAND:=find . -path '*/\.*' -prune -o -type d -print 2>/dev/null | sed 's|^\./||'}"
 
 # --- Helper: run fuzzyseek with TUI on /dev/tty ---
-# Input is piped in from calling function; stderr goes to /dev/tty for TUI rendering.
-# stdin is redirected from /dev/tty so fuzzyseek can read keyboard input.
+# Candidates arrive via stdin from the pipe. Keyboard input is read from /dev/tty
+# internally by crossterm (use-dev-tty feature). TUI renders on stderr → /dev/tty.
 __fuzzyseek_cmd() {
-  command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS "$@" 2>/dev/tty </dev/tty
+  command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS "$@" 2>/dev/tty
 }
 
 # --- Quote a path for safe insertion into the command line ---
@@ -45,7 +45,7 @@ fuzzyseek-history-widget() {
   # fc -rl 1 lists history; pipe to fuzzyseek; stdin from /dev/tty for keyboard
   output=$(
     fc -rl 1 | sed 's/^ *[0-9]* *//' |
-    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --query "$LBUFFER" $FUZZYSEEK_CTRL_R_OPTS 2>/dev/tty </dev/tty
+    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --query "$LBUFFER" $FUZZYSEEK_CTRL_R_OPTS 2>/dev/tty
   )
   local ret=$?
   if [[ $ret -eq 0 && -n "$output" ]]; then
@@ -61,7 +61,7 @@ fuzzyseek-file-widget() {
   local output
   output=$(
     eval "$FUZZYSEEK_CTRL_T_COMMAND" |
-    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --multi $FUZZYSEEK_CTRL_T_OPTS 2>/dev/tty </dev/tty
+    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --multi $FUZZYSEEK_CTRL_T_OPTS 2>/dev/tty
   )
   local ret=$?
   if [[ $ret -eq 0 && -n "$output" ]]; then
@@ -88,7 +88,7 @@ fuzzyseek-cd-widget() {
   local output
   output=$(
     eval "$FUZZYSEEK_ALT_C_COMMAND" |
-    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS 2>/dev/tty </dev/tty
+    command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS 2>/dev/tty
   )
   if [[ -n "$output" ]]; then
     cd -- "$output"
@@ -119,7 +119,7 @@ fuzzyseek-completion() {
     output=$(
       find "$find_dir" -name '.*' -prune -o -print 2>/dev/null |
       sed "s|^${find_dir}/||" |
-      command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --query "$suffix" 2>/dev/tty </dev/tty
+      command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS --query "$suffix" 2>/dev/tty
     )
 
     if [[ -n "$output" ]]; then

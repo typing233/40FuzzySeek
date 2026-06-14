@@ -15,9 +15,8 @@ __FUZZYSEEK_BASH_LOADED=1
 : "${FUZZYSEEK_ALT_C_COMMAND:=find . -path '*/\.*' -prune -o -type d -print 2>/dev/null | sed 's|^\./||'}"
 
 # --- Helper: invoke fuzzyseek safely with TTY for both stdin and stderr ---
-# The key insight: fuzzyseek renders TUI on stderr and outputs selection on stdout.
-# We must give it /dev/tty as stderr for rendering. Input comes from the pipe on stdin.
-# The calling function provides piped input via process substitution or heredoc.
+# fuzzyseek renders TUI on stderr (/dev/tty) and reads keyboard from /dev/tty
+# internally (via crossterm use-dev-tty). Candidates arrive via stdin from the pipe.
 __fuzzyseek_cmd() {
   command "$FUZZYSEEK_CMD" $FUZZYSEEK_DEFAULT_OPTS "$@" 2>/dev/tty
 }
@@ -35,13 +34,12 @@ __fuzzyseek_quote() {
 }
 
 # --- Ctrl+R: History search ---
-# Uses a heredoc-style pipe so we don't consume the terminal's stdin
 __fuzzyseek_history() {
   local output
   output=$(
     HISTTIMEFORMAT= builtin history |
     command sed 's/^ *[0-9]* *//' |
-    __fuzzyseek_cmd --query "$READLINE_LINE" $FUZZYSEEK_CTRL_R_OPTS </dev/tty
+    __fuzzyseek_cmd --query "$READLINE_LINE" $FUZZYSEEK_CTRL_R_OPTS
   )
   local ret=$?
   if [[ $ret -eq 0 && -n "$output" ]]; then
@@ -55,7 +53,7 @@ __fuzzyseek_file_widget() {
   local output
   output=$(
     eval "$FUZZYSEEK_CTRL_T_COMMAND" |
-    __fuzzyseek_cmd --multi $FUZZYSEEK_CTRL_T_OPTS </dev/tty
+    __fuzzyseek_cmd --multi $FUZZYSEEK_CTRL_T_OPTS
   )
   local ret=$?
   if [[ $ret -eq 0 && -n "$output" ]]; then
@@ -80,7 +78,7 @@ __fuzzyseek_cd() {
   local output
   output=$(
     eval "$FUZZYSEEK_ALT_C_COMMAND" |
-    __fuzzyseek_cmd $FUZZYSEEK_DEFAULT_OPTS </dev/tty
+    __fuzzyseek_cmd $FUZZYSEEK_DEFAULT_OPTS
   )
   if [[ -n "$output" ]]; then
     builtin cd -- "$output" || return
@@ -104,7 +102,7 @@ __fuzzyseek_completion() {
     output=$(
       find "$find_dir" -name '.*' -prune -o -print 2>/dev/null |
       sed "s|^${find_dir}/||" |
-      __fuzzyseek_cmd --query "$suffix" </dev/tty
+      __fuzzyseek_cmd --query "$suffix"
     )
 
     if [[ -n "$output" ]]; then

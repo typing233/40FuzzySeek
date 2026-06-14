@@ -64,8 +64,42 @@ fn parse_ps_aux(line: &str) -> ParsedLine {
 }
 
 fn parse_ls(line: &str) -> ParsedLine {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let filename = parts.last().unwrap_or(&line).to_string();
+    // ls -l format: perms links user group size month day time/year filename...
+    // The filename starts after the 8th whitespace-separated field and may contain spaces.
+    let mut field_end = 0;
+    let bytes = line.as_bytes();
+    let mut fields_skipped = 0;
+
+    while fields_skipped < 8 && field_end < bytes.len() {
+        // skip whitespace
+        while field_end < bytes.len() && bytes[field_end] == b' ' {
+            field_end += 1;
+        }
+        // skip non-whitespace (one field)
+        while field_end < bytes.len() && bytes[field_end] != b' ' {
+            field_end += 1;
+        }
+        fields_skipped += 1;
+    }
+
+    // skip trailing space between last field and filename
+    while field_end < bytes.len() && bytes[field_end] == b' ' {
+        field_end += 1;
+    }
+
+    let filename = if field_end < bytes.len() {
+        // Handle symlinks: "name -> target", extract just the name
+        let raw = &line[field_end..];
+        if let Some(arrow_pos) = raw.find(" -> ") {
+            raw[..arrow_pos].to_string()
+        } else {
+            raw.to_string()
+        }
+    } else {
+        // Fallback: couldn't parse, use whole line
+        line.to_string()
+    };
+
     ParsedLine {
         display: line.to_string(),
         search_text: filename.clone(),
@@ -161,9 +195,25 @@ mod tests {
     fn test_parse_ls_extracts_filename() {
         let line = "-rw-r--r--  1 user user 12345 Jan 15 10:30 my file.txt";
         let parsed = parse_ls(line);
-        assert_eq!(parsed.output_text, "file.txt");
+        assert_eq!(parsed.output_text, "my file.txt");
+        assert_eq!(parsed.search_text, "my file.txt");
         // Display shows full ls output
         assert_eq!(parsed.display, line);
+    }
+
+    #[test]
+    fn test_parse_ls_symlink() {
+        let line = "lrwxrwxrwx  1 user user    20 Jan 15 10:30 link name -> /target/path";
+        let parsed = parse_ls(line);
+        assert_eq!(parsed.output_text, "link name");
+        assert_eq!(parsed.search_text, "link name");
+    }
+
+    #[test]
+    fn test_parse_ls_quoted_filename() {
+        let line = "-rw-r--r--  1 user user 12345 Jan 15 10:30 file with 'quotes' and \"doubles\"";
+        let parsed = parse_ls(line);
+        assert_eq!(parsed.output_text, "file with 'quotes' and \"doubles\"");
     }
 
     #[test]

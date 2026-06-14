@@ -37,6 +37,9 @@ pub trait InputProvider: Send + 'static {
 #[derive(Clone)]
 pub enum InputSource {
     Stdin,
+    /// Read from an already-opened file descriptor (used when stdin was saved before dup2)
+    #[cfg(unix)]
+    RawFd(i32),
     File(String),
     Command { cmd: String, shell: Option<String> },
 }
@@ -47,6 +50,24 @@ impl InputProvider for StdinProvider {
     fn start(&self, store: SharedStore, config: ProviderConfig) -> io::Result<()> {
         thread::spawn(move || {
             let reader = BufReader::with_capacity(256 * 1024, io::stdin());
+            read_lines_into_store(reader, store, config);
+        });
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct RawFdProvider {
+    fd: i32,
+}
+
+#[cfg(unix)]
+impl InputProvider for RawFdProvider {
+    fn start(&self, store: SharedStore, config: ProviderConfig) -> io::Result<()> {
+        use std::os::unix::io::FromRawFd;
+        let file = unsafe { std::fs::File::from_raw_fd(self.fd) };
+        thread::spawn(move || {
+            let reader = BufReader::with_capacity(256 * 1024, file);
             read_lines_into_store(reader, store, config);
         });
         Ok(())
@@ -119,6 +140,8 @@ impl InputSource {
     fn into_provider(self) -> Box<dyn InputProvider> {
         match self {
             InputSource::Stdin => Box::new(StdinProvider),
+            #[cfg(unix)]
+            InputSource::RawFd(fd) => Box::new(RawFdProvider { fd }),
             InputSource::File(path) => Box::new(FileProvider { path }),
             InputSource::Command { cmd, shell } => Box::new(CommandProvider { cmd, shell }),
         }
@@ -141,12 +164,11 @@ fn read_lines_into_store(reader: impl BufRead, store: SharedStore, config: Provi
     let mut output_batch: Vec<Arc<str>> = Vec::with_capacity(CHUNK_SIZE);
     let mut total_read: usize = 0;
 
-    // Determine parser: explicit config, or auto-detect from first few lines
+    // Determine parser: explicit config, or auto-detect from the first line only.
+    // We detect on just the first line to avoid delaying streaming for plain text.
     let mut parser: Option<ParserKind> = config.parser.clone();
-    let mut pending_detect: Vec<String> = Vec::new();
     let auto_detect = config.auto_detect_parser && parser.is_none();
-    let detect_lines = 3; // sample first N lines for detection
-    let use_parser = config.parser.is_some() || config.auto_detect_parser;
+    let mut first_line = auto_detect; // true = still waiting for line 1 to decide
 
     for line in reader.lines() {
         match line {
@@ -155,37 +177,19 @@ fn read_lines_into_store(reader: impl BufRead, store: SharedStore, config: Provi
                     l.truncate(config.max_line_length);
                 }
 
-                // Auto-detect phase: buffer first few lines
-                if auto_detect && parser.is_none() && pending_detect.len() < detect_lines {
-                    pending_detect.push(l.clone());
-                    if pending_detect.len() == detect_lines {
-                        let refs: Vec<&str> = pending_detect.iter().map(|s| s.as_str()).collect();
-                        parser = ParserKind::detect(&refs);
+                // Auto-detect on the very first line, zero extra buffering
+                if first_line {
+                    first_line = false;
+                    let refs = [l.as_str()];
+                    parser = ParserKind::detect(&refs);
 
-                        // If no parser detected, downgrade to no-parser mode
-                        if parser.is_none() {
-                            // Flush pending lines without parsing
-                            let mut s = store.write();
-                            s.parsed = None; // disable parsed mode
-                            drop(s);
-
-                            for pending_line in pending_detect.drain(..) {
-                                let arc = Arc::from(pending_line.into_boxed_str());
-                                display_batch.push(arc);
-                                total_read += 1;
-                            }
-                        } else {
-                            // Flush pending lines WITH parsing
-                            for pending_line in pending_detect.drain(..) {
-                                let parsed = parser.as_ref().unwrap().parse_line(&pending_line);
-                                display_batch.push(Arc::from(parsed.display.into_boxed_str()));
-                                search_batch.push(Arc::from(parsed.search_text.into_boxed_str()));
-                                output_batch.push(Arc::from(parsed.output_text.into_boxed_str()));
-                                total_read += 1;
-                            }
-                        }
+                    if parser.is_none() {
+                        // Not structured — disable parsed mode, treat as plain text
+                        let mut s = store.write();
+                        s.parsed = None;
+                        drop(s);
                     }
-                    continue;
+                    // Fall through to process this line normally below
                 }
 
                 // Normal processing
@@ -223,35 +227,6 @@ fn read_lines_into_store(reader: impl BufRead, store: SharedStore, config: Provi
                 }
             }
             Err(_) => break,
-        }
-    }
-
-    // Flush remaining pending_detect lines if we never hit detect_lines count
-    if !pending_detect.is_empty() {
-        if auto_detect && parser.is_none() {
-            // Try detect with what we have
-            let refs: Vec<&str> = pending_detect.iter().map(|s| s.as_str()).collect();
-            parser = ParserKind::detect(&refs);
-        }
-
-        if let Some(ref p) = parser {
-            for pending_line in pending_detect.drain(..) {
-                let parsed = p.parse_line(&pending_line);
-                display_batch.push(Arc::from(parsed.display.into_boxed_str()));
-                search_batch.push(Arc::from(parsed.search_text.into_boxed_str()));
-                output_batch.push(Arc::from(parsed.output_text.into_boxed_str()));
-                total_read += 1;
-            }
-        } else {
-            // No parser, disable parsed mode and flush raw
-            {
-                let mut s = store.write();
-                s.parsed = None;
-            }
-            for pending_line in pending_detect.drain(..) {
-                display_batch.push(Arc::from(pending_line.into_boxed_str()));
-                total_read += 1;
-            }
         }
     }
 

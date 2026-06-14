@@ -125,6 +125,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // On Unix, when stdin is a pipe (candidates), we need crossterm to read keyboard
+    // from /dev/tty. Save the pipe fd and replace fd 0 with /dev/tty.
+    #[cfg(unix)]
+    let input_source = {
+        use input::InputSource;
+        match input_source {
+            InputSource::Stdin => {
+                match swap_stdin_with_tty() {
+                    Ok(saved_fd) => InputSource::RawFd(saved_fd),
+                    Err(_) => InputSource::Stdin,
+                }
+            }
+            other => other,
+        }
+    };
+
     let is_inline = config.height > 0;
     let inline_height = config.height;
 
@@ -203,4 +219,34 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// On Unix: dup the current stdin (pipe with candidates) to a new fd, then dup2 /dev/tty
+/// onto fd 0 so crossterm can read keyboard events from the tty.
+/// Returns the saved fd that holds the original pipe.
+#[cfg(unix)]
+fn swap_stdin_with_tty() -> Result<i32, io::Error> {
+    use std::os::unix::io::AsRawFd;
+
+    let tty = std::fs::File::open("/dev/tty")?;
+    let tty_fd = tty.as_raw_fd();
+
+    // Save the original stdin (pipe) to a new fd
+    let saved_fd = unsafe { libc::dup(0) };
+    if saved_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Replace fd 0 with /dev/tty
+    let ret = unsafe { libc::dup2(tty_fd, 0) };
+    if ret < 0 {
+        unsafe { libc::close(saved_fd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    // Set close-on-exec on saved_fd so it doesn't leak to child processes
+    unsafe { libc::fcntl(saved_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+
+    // tty file gets dropped here, closing tty_fd (fd 0 still points to /dev/tty via dup2)
+    Ok(saved_fd)
 }

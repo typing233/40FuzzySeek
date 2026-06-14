@@ -355,12 +355,13 @@ fn test_shell_integration_bash_has_tty_redirect() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Must have </dev/tty to separate keyboard from piped data
-    assert!(stdout.contains("</dev/tty"),
-        "bash integration missing </dev/tty redirect for keyboard input");
     // Must have 2>/dev/tty for TUI rendering
     assert!(stdout.contains("2>/dev/tty"),
         "bash integration missing 2>/dev/tty redirect for TUI");
+    // Must NOT have </dev/tty — crossterm reads keyboard from /dev/tty internally;
+    // redirecting stdin from tty would override the candidate pipe
+    assert!(!stdout.contains("</dev/tty"),
+        "bash integration must not redirect stdin from /dev/tty (would eat piped candidates)");
 }
 
 #[test]
@@ -391,8 +392,8 @@ fn test_shell_integration_zsh_has_quoting() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("__fuzzyseek_quote"),
         "zsh integration must have a quoting function for safe path insertion");
-    assert!(stdout.contains("</dev/tty"),
-        "zsh integration missing </dev/tty redirect");
+    assert!(stdout.contains("2>/dev/tty"),
+        "zsh integration missing 2>/dev/tty redirect for TUI");
 }
 
 #[test]
@@ -408,8 +409,8 @@ fn test_shell_integration_fish_has_escape() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("__fuzzyseek_escape"),
         "fish integration must have an escape function for safe path insertion");
-    assert!(stdout.contains("</dev/tty"),
-        "fish integration missing </dev/tty redirect");
+    assert!(stdout.contains("2>/dev/tty"),
+        "fish integration missing 2>/dev/tty redirect for TUI");
 }
 
 #[test]

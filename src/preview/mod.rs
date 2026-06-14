@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use parking_lot::Mutex;
 
 use cache::PreviewCache;
@@ -213,31 +216,42 @@ fn run_preview_command(
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let shell_arg = if cfg!(windows) { "/C" } else { "-c" };
 
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .arg(shell_arg)
         .arg(cmd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            let msg = match e.kind() {
-                io::ErrorKind::NotFound => {
-                    format!("shell '{}' not found: {}", shell, e)
-                }
-                io::ErrorKind::PermissionDenied => {
-                    format!("permission denied running '{}': {}", shell, e)
-                }
-                _ => format!("failed to spawn preview command: {}", e),
-            };
-            PreviewError::Failed(msg)
-        })?;
+        .stderr(Stdio::piped());
 
+    // On Unix, spawn in a new process group so we can kill the entire tree
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = command.spawn().map_err(|e| {
+        let msg = match e.kind() {
+            io::ErrorKind::NotFound => {
+                format!("shell '{}' not found: {}", shell, e)
+            }
+            io::ErrorKind::PermissionDenied => {
+                format!("permission denied running '{}': {}", shell, e)
+            }
+            _ => format!("failed to spawn preview command: {}", e),
+        };
+        PreviewError::Failed(msg)
+    })?;
+
+    let pid = child.id();
     let poll_interval = Duration::from_millis(50);
     let mut elapsed = Duration::ZERO;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
+            kill_process_group(pid);
             let _ = child.wait();
             return Err(PreviewError::Cancelled);
         }
@@ -261,7 +275,7 @@ fn run_preview_command(
             Ok(None) => {
                 elapsed += poll_interval;
                 if elapsed >= timeout {
-                    let _ = child.kill();
+                    kill_process_group(pid);
                     let _ = child.wait();
                     return Err(PreviewError::Timeout);
                 }
@@ -282,19 +296,16 @@ fn run_preview_command(
 
     let result = String::from_utf8_lossy(&stdout).into_owned();
 
-    // If stdout is empty but stderr has content, show stderr as error
     if result.is_empty() && !output.stderr.is_empty() {
         let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
         let first_line = stderr_text.lines().next().unwrap_or(&stderr_text);
         return Err(PreviewError::Failed(first_line.to_string()));
     }
 
-    // If command exited non-zero with stdout content, still show it but prepend warning
     if !output.status.success() && !result.is_empty() {
         return Ok(result);
     }
 
-    // If command exited non-zero with no output at all
     if !output.status.success() && result.is_empty() {
         let code = output.status.code().unwrap_or(-1);
         return Err(PreviewError::Failed(
@@ -303,6 +314,23 @@ fn run_preview_command(
     }
 
     Ok(result)
+}
+
+/// Kill an entire process group. On Unix, sends SIGKILL to the process group
+/// (negative pid). On other platforms, falls back to killing just the process.
+fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            // Kill the process group (negative pgid)
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // On Windows, Command::kill handles it; this is a fallback
+        let _ = pid;
+    }
 }
 
 use std::io;
@@ -439,6 +467,45 @@ mod tests {
         assert_eq!(s.current_line, "second");
         // Should have content (either Text or Loading depending on timing)
         assert!(!matches!(s.content, PreviewContent::Empty));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cancel_kills_child_process_tree() {
+        // Verify that cancelling a complex pipeline (sh -c "sleep 300 & wait")
+        // doesn't leave orphan processes behind.
+        use std::process::Command as StdCommand;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+
+        // Use a unique marker so we can grep for it
+        let marker = format!("fuzzyseek_test_{}", std::process::id());
+        let cmd = format!("sleep 300 & echo {}; wait", marker);
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            cancel_clone.store(true, Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let _ = run_preview_command(&cmd, Duration::from_secs(30), 1_000_000, &cancel);
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(1));
+
+        // Give a moment for the signal to propagate
+        thread::sleep(Duration::from_millis(100));
+
+        // Check that no process with our marker's sleep is still running
+        let ps_output = StdCommand::new("sh")
+            .arg("-c")
+            .arg(format!("ps aux | grep 'sleep 300' | grep -v grep"))
+            .output()
+            .unwrap();
+        let ps_text = String::from_utf8_lossy(&ps_output.stdout);
+        assert!(!ps_text.contains("sleep 300"),
+            "Orphan process still running after cancel: {}", ps_text);
     }
 }
 
