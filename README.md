@@ -11,9 +11,16 @@
 - **ANSI 安全**：带颜色输入不破坏界面，strip-ansi-escapes 剥离后再匹配和高亮
 - **稳定排序**：相同分数按原始行号排列，结果可预测
 - **全屏/半屏**：`--height N` 指定行数以内联模式运行，不占满终端
-- **多选模式**：Tab 切换选中，Ctrl+A 全选，Ctrl+D 全不选
-- **预览面板**：`--preview` 非阻塞异步执行，慢命令不卡 UI
+- **多选模式**：Tab/Ctrl+Space 切换选中，Ctrl+A 全选，Ctrl+D 全不选
+- **预览面板**：`--preview` 非阻塞异步执行，带超时、取消、缓存、错误展示
+- **类型预览**：配置文件可为不同文件类型指定不同预览命令
+- **主题系统**：暗/亮主题，支持环境变量、配置文件、CLI 优先级合并
+- **可扩展输入**：支持管道、文件、命令执行（`--cmd`），可配 max-items 防 OOM
+- **格式自动解析**：`ps aux`、`ls -l`、`history` 等输出结构化解析
+- **冲突检测**：`--bind` 重映射时自动检测并警告键冲突
 - **自定义快捷键**：`--bind` 参数 + 配置文件，可重映射所有动作
+- **Shell 集成**：Bash/Zsh/Fish 一键开启 Ctrl+R/Ctrl+T/** 补全
+- **Vim 插件**：`:FuzzySeek` 命令直接在 Vim/Neovim 中使用
 - **自适应终端**：resize 自动重绘
 - **退出码**：0=选中，130=取消(Ctrl+C/ESC)，2=错误（附明确错误信息）
 
@@ -39,24 +46,112 @@ find . -type f | fuzzyseek
 # 从文件读取
 fuzzyseek --file candidates.txt
 
+# 从命令输出读取
+fuzzyseek --cmd "find . -type f"
+
 # 半屏模式（只占 15 行，不进入 alternate screen）
 find . -type f | fuzzyseek --height 15
 
 # 多选模式
 cat urls.txt | fuzzyseek --multi
 
-# 带预览（非阻塞，异步执行）
+# 带预览（非阻塞，异步执行，5秒超时）
 find . -name "*.rs" | fuzzyseek --preview "head -20 {}"
+
+# 自定义预览超时
+fuzzyseek --file list.txt --preview "cat {}" --preview-timeout 3000
 
 # 初始查询
 ps aux | fuzzyseek --query "python"
+
+# 限制最大行数（OOM 保护）
+fuzzyseek --cmd "find / -type f" --max-items 100000
 
 # 自定义分隔符（NUL 分隔输出）
 find . -type f | fuzzyseek --multi --delimiter $'\0'
 
 # 自定义快捷键
 fuzzyseek --file list.txt --bind "confirm:ctrl-y,cancel:ctrl-q"
+
+# 使用亮色主题
+fuzzyseek --file list.txt --theme light
 ```
+
+## 主题
+
+FuzzySeek 支持暗色（默认）和亮色主题，优先级：CLI > 配置文件 > 环境变量 > 默认。
+
+```bash
+# CLI 指定
+fuzzyseek --theme light
+
+# 环境变量
+export FUZZYSEEK_THEME=light
+
+# 配置文件（~/.config/fuzzyseek/config.toml）
+[theme]
+base = "light"
+cursor_fg = "#0066cc"
+highlight_fg = "red"
+selected_fg = "magenta"
+```
+
+支持的颜色值：命名颜色（red, green, blue, cyan, magenta, yellow, white, black, darkgray 等）、十六进制（`#rrggbb`）、256色索引（0-255）。
+
+## Shell 集成
+
+### Bash
+
+```bash
+# 在 ~/.bashrc 中添加
+eval "$(fuzzyseek --shell-integration bash)"
+```
+
+提供：
+- **Ctrl+R**：模糊搜索命令历史
+- **Ctrl+T**：搜索文件并插入路径
+- **Alt+C**：搜索目录并 cd
+- **\*\* 补全**：输入路径后跟 `**` 触发模糊补全
+
+### Zsh
+
+```zsh
+# 在 ~/.zshrc 中添加
+eval "$(fuzzyseek --shell-integration zsh)"
+```
+
+### Fish
+
+```fish
+# 在 ~/.config/fish/config.fish 中添加
+fuzzyseek --shell-integration fish | source
+```
+
+### 自定义搜索命令
+
+```bash
+# 使用 fd 替代 find
+export FUZZYSEEK_CTRL_T_COMMAND="fd --type f --hidden --follow"
+export FUZZYSEEK_ALT_C_COMMAND="fd --type d --hidden --follow"
+```
+
+## Vim/Neovim 集成
+
+将 `shell/fuzzyseek.vim` 放入 Vim 的插件目录，或使用插件管理器。
+
+```vim
+" 使用 vim-plug
+Plug 'path/to/fuzzyseek', { 'rtp': 'shell' }
+```
+
+提供命令：
+- `:FuzzySeek` / `:FuzzySeekFiles` - 查找文件并编辑
+- `:FuzzySeekSplit` / `:FuzzySeekVsplit` / `:FuzzySeekTab` - 分屏打开
+- `:FuzzySeekBuffers` - 切换 Buffer
+- `:FuzzySeekHistory` - 命令历史
+- `:FuzzySeekGrep <pattern>` - Grep 搜索
+
+默认映射：`<leader>ff`(文件) `<leader>fb`(Buffer) `<leader>fh`(历史)
 
 ## 快捷键
 
@@ -68,16 +163,20 @@ fuzzyseek --file list.txt --bind "confirm:ctrl-y,cancel:ctrl-q"
 | Esc / Ctrl+C | cancel | 取消 |
 | ↑ / Ctrl+P | up | 上移光标 |
 | ↓ / Ctrl+N | down | 下移光标 |
+| Home | home | 跳到第一项 |
+| End | end | 跳到最后一项 |
 | PageUp | page-up | 上翻页 |
 | PageDown | page-down | 下翻页 |
 | Ctrl+E | scroll-down | 滚动视口下 |
 | Ctrl+Y | scroll-up | 滚动视口上 |
-| Tab | toggle | 切换选中（多选模式）|
+| Tab / Ctrl+Space | toggle | 切换选中（多选模式）|
 | Ctrl+A | select-all | 全选（多选模式）|
 | Ctrl+D | deselect-all | 取消全选 |
 | Ctrl+U | clear-query | 清空查询 |
 | Ctrl+W | delete-word | 删除最后一个词 |
 | Backspace | backspace | 删除最后一个字符 |
+| Ctrl+\\ | toggle-preview | 切换预览面板显示 |
+| Ctrl+R | refresh-preview | 刷新预览 |
 | 鼠标滚轮 | — | 上下滚动 |
 
 ## 自定义快捷键
@@ -89,6 +188,8 @@ fuzzyseek --file list.txt --bind "confirm:ctrl-y,cancel:ctrl-q"
 ```bash
 fuzzyseek --bind "confirm:ctrl-y,cancel:ctrl-q,up:ctrl-k,down:ctrl-j"
 ```
+
+冲突检测：如果绑定的键已被其他动作使用，会输出警告并自动重映射。
 
 ### 通过配置文件
 
@@ -102,7 +203,14 @@ up = "ctrl-k"
 down = "ctrl-j"
 toggle = "ctrl-space"
 select-all = "alt-a"
+toggle-preview = "ctrl-p"
 ```
+
+### 可绑定的动作
+
+`confirm`、`cancel`、`up`、`down`、`home`、`end`、`page-up`、`page-down`、
+`toggle`、`select-all`、`deselect-all`、`backspace`、`clear-query`、`delete-word`、
+`scroll-up`、`scroll-down`、`toggle-preview`、`refresh-preview`
 
 ### 可用的键名
 
@@ -111,11 +219,44 @@ select-all = "alt-a"
 `del`/`delete`、`up`、`down`、`left`、`right`、`home`、`end`、`pgup`、`pgdn`、`space`、
 单字符如 `a`-`z`、`0`-`9`
 
-### 可绑定的动作
+## 配置文件
 
-`confirm`、`cancel`、`up`、`down`、`page-up`、`page-down`、`toggle`、
-`select-all`、`deselect-all`、`backspace`、`clear-query`、`delete-word`、
-`scroll-up`、`scroll-down`
+完整配置示例 `~/.config/fuzzyseek/config.toml`：
+
+```toml
+[keys]
+confirm = "ctrl-m"
+cancel = "ctrl-g"
+up = "ctrl-k"
+down = "ctrl-j"
+
+[theme]
+base = "dark"
+cursor_fg = "cyan"
+highlight_fg = "yellow"
+selected_fg = "green"
+
+[preview]
+timeout_ms = 5000
+cache_size = 64
+max_output_bytes = 1048576
+
+[[preview.rules]]
+pattern = "ext:rs"
+cmd = "bat --color=always {}"
+
+[[preview.rules]]
+pattern = "ext:md"
+cmd = "glow {}"
+
+[[preview.rules]]
+pattern = "ext:png"
+cmd = "chafa {}"
+
+[input]
+max_items = 500000
+max_line_length = 4096
+```
 
 ## 命令行参数
 
@@ -123,64 +264,63 @@ select-all = "alt-a"
 Usage: fuzzyseek [OPTIONS]
 
 Options:
-  -f, --file <FILE>           从文件读取输入
-  -m, --multi                 启用多选模式
-  -p, --preview <COMMAND>     预览命令（{} 为占位符，异步执行不阻塞 UI）
-  -q, --query <QUERY>         初始查询字符串
-      --height <HEIGHT>       高度行数（0=全屏，>0 = 内联半屏）[默认: 0]
-  -d, --delimiter <DELIM>     输出分隔符 [默认: \n]
-      --bind <BIND>           自定义快捷键（action:key,action:key）
-  -h, --help                  帮助
-  -V, --version               版本
+  -f, --file <FILE>               从文件读取输入
+      --cmd <CMD>                 从命令输出读取输入
+  -m, --multi                     启用多选模式
+  -p, --preview <COMMAND>         预览命令（{} 为占位符）
+      --preview-timeout <MS>      预览超时毫秒 [默认: 5000]
+  -q, --query <QUERY>             初始查询字符串
+      --height <HEIGHT>           高度行数（0=全屏）[默认: 0]
+  -d, --delimiter <DELIM>         输出分隔符 [默认: \n]
+      --bind <BIND>               自定义快捷键
+      --theme <THEME>             主题 (dark/light)
+      --max-items <N>             最大读取行数（OOM 保护）
+      --shell-integration <SHELL> 打印 Shell 集成脚本 (bash/zsh/fish)
+  -h, --help                      帮助
+  -V, --version                   版本
 ```
 
 ## 架构
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  Input Thread           │  Matcher Thread             │
-│  ─────────────          │  ──────────────             │
-│  BufReader(256KB)       │  nucleo Atom                │
-│  → chunked Arc<str>     │  → 8192-item scan chunks    │
-│    (16384 per chunk)    │  → AtomicBool cancel        │
-│  → SharedStore(RwLock)  │  → swap-buffer update       │
-│                         │  → stable sort (score,idx)  │
-│                         │  → SharedMatchState(RwLock) │
-├─────────────────────────┴────────────────────────────┤
-│  Preview Thread (optional)                            │
-│  ─────────────────────────                            │
-│  async Command execution, generation counter          │
-│  only latest request displayed, old cancelled         │
-├──────────────────────────────────────────────────────┤
-│  Main Thread (TUI)                                    │
-│  ─────────────────                                    │
-│  crossterm events (50ms poll)                         │
-│  ratatui rendering (Fullscreen or Inline viewport)    │
-│  only draws visible rows (virtual scrolling)          │
-│  unicode-width cursor positioning                     │
-│  ANSI-stripped highlight indexing                      │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Input Provider (trait)                                    │
+│  ─────────────────────                                    │
+│  StdinProvider / FileProvider / CommandProvider            │
+│  → BufReader(256KB) → chunked Arc<str> → SharedStore      │
+│  → ProviderConfig: max_items, max_line_length             │
+├──────────────────────────────────────────────────────────┤
+│  Matcher Thread                                           │
+│  ──────────────                                           │
+│  nucleo Atom engine, 8192-item scan chunks                │
+│  AtomicBool cancel, swap-buffer update                    │
+│  stable sort (score desc, index asc)                      │
+├──────────────────────────────────────────────────────────┤
+│  Preview System                                           │
+│  ──────────────                                           │
+│  PreviewResolver (type-based command selection)           │
+│  PreviewRunner (timeout + cancel + generation)            │
+│  PreviewCache (LRU, configurable capacity)                │
+│  Error display in panel                                   │
+├──────────────────────────────────────────────────────────┤
+│  Theme System                                             │
+│  ────────────                                             │
+│  Priority: CLI > config.toml > $FUZZYSEEK_THEME > dark   │
+│  Dark/Light builtin, custom color overrides               │
+├──────────────────────────────────────────────────────────┤
+│  KeyBind System                                           │
+│  ─────────────                                            │
+│  HashMap<Action, Vec<KeyBind>>                            │
+│  Conflict detection + warning on --bind reassignment      │
+│  18 actions, configurable via TOML or CLI                 │
+├──────────────────────────────────────────────────────────┤
+│  Main Thread (TUI)                                        │
+│  ─────────────────                                        │
+│  crossterm events (50ms poll), ratatui rendering          │
+│  Fullscreen or Inline viewport, virtual scrolling         │
+│  unicode-width cursor, ANSI-stripped highlighting         │
+└──────────────────────────────────────────────────────────┘
 ```
-
-### 低内存设计
-
-- **分块存储**：输入按 16384 行一个 Chunk 存储，避免单个 Vec 的巨型 realloc
-- **Arc\<str\> 共享**：每行是 Arc\<str\>，读取线程和匹配线程零拷贝共享
-- **索引级结果**：MatchResult 只含 `(index, score, positions)`，不持有字符串
-- **Swap-buffer**：匹配线程与 UI 之间通过 swap 交换结果 Vec，避免每轮 clone
-- **RwLock**：读多写少场景使用 RwLock 替代 Mutex，UI 读不阻塞
-
-### ANSI / Unicode 处理
-
-- 输入带有 ANSI 转义码（如 `ls --color`）时，先 strip 再匹配和计算 highlight 位置
-- 显示时使用 stripped 文本渲染，避免残留的 escape 序列破坏布局
-- 查询输入框使用 `unicode-width` 计算视觉宽度，中文等宽字符光标位置正确
-
-### 非阻塞预览
-
-- 每次光标移动触发预览请求，由独立线程执行 shell 命令
-- 使用 generation counter 保证只显示最新请求的结果
-- 预览执行期间显示 "Loading..."，主事件循环不被阻塞
 
 ## 性能基准
 
@@ -198,33 +338,10 @@ cargo bench
 | Unicode 匹配 | 10,000 行 | ~3ms |
 | ANSI 剥离 | 10,000 行 | ~1ms |
 
-内存占用：
-
-- 每行约 64-80 字节（Arc\<str\> 头 + 字符串数据）
-- 100 万行 ≈ 80-100 MB RSS
-- 匹配结果只持有 `(usize, u32, Vec<u32>)` 约 40 字节/匹配项
-
-## 依赖说明
-
-| 依赖 | 版本 | 用途 |
-|------|------|------|
-| ratatui | 0.28 | TUI 框架（Fullscreen + Inline viewport）|
-| crossterm | 0.28 | 终端后端（事件、raw mode、鼠标）|
-| nucleo | 0.5 | 模糊匹配引擎（Helix 编辑器同款）|
-| nucleo-matcher | 0.3 | nucleo 底层匹配器 API |
-| unicode-width | 0.2 | Unicode 宽字符宽度计算（光标定位）|
-| strip-ansi-escapes | 0.2 | ANSI 转义序列安全剥离 |
-| clap | 4.x | 命令行参数解析 |
-| parking_lot | 0.12 | 高性能 RwLock/Mutex |
-| serde + toml | 1.x / 0.8 | 配置文件解析 |
-| dirs | 6.x | 跨平台配置目录定位 |
-| criterion | 0.5 | 性能基准测试（dev） |
-| tempfile | 3.x | 集成测试临时文件（dev） |
-
 ## 测试
 
 ```bash
-# 运行所有测试
+# 运行所有测试（66个：46单元 + 20集成）
 cargo test
 
 # 运行基准
@@ -233,14 +350,11 @@ cargo bench
 # 快速冒烟测试
 seq 1 1000000 | cargo run --release -- --query "999"
 
-# 中文输入测试
-printf "你好世界\n测试数据\n模糊搜索\n" | cargo run --release -- --query "模糊"
+# 命令输入测试
+cargo run --release -- --cmd "seq 1 10000" --query "555"
 
-# ANSI 颜色输入测试
-ls --color=always | cargo run --release
-
-# 半屏模式测试
-find . -type f | cargo run --release -- --height 10
+# 主题测试
+find . -type f | cargo run --release -- --theme light
 ```
 
 ## 退出码
@@ -251,21 +365,6 @@ find . -type f | cargo run --release -- --height 10
 | 2 | 错误（文件不存在、无终端、参数错误等）|
 | 130 | 用户取消（Ctrl+C 或 ESC） |
 
-## 错误处理
-
-所有错误路径都给出明确提示并返回退出码 2：
-
-```
-fuzzyseek: cannot open 'xxx': No such file or directory
-fuzzyseek: stderr is not a terminal, cannot display TUI
-fuzzyseek: no input (provide --file or pipe data via stdin)
-fuzzyseek: invalid --bind format 'xxx', expected action:key
-fuzzyseek: unknown action 'xxx'
-fuzzyseek: unknown key 'xxx' in 'yyy'
-fuzzyseek: cannot read config file: ...
-fuzzyseek: invalid config file: ...
-```
-
 ## 跨平台兼容性
 
 | 平台 | 状态 | 备注 |
@@ -273,12 +372,7 @@ fuzzyseek: invalid config file: ...
 | Linux (x86_64/aarch64) | ✓ 完全支持 | 主要开发平台 |
 | macOS (Intel/Apple Silicon) | ✓ 完全支持 | crossterm 原生支持 |
 | Windows 10/11 | ✓ 支持 | Windows Terminal / ConPTY |
-| Windows (旧版 cmd.exe) | △ 部分 | ANSI 支持有限，鼠标可能受限 |
 | WSL/WSL2 | ✓ 完全支持 | 等同 Linux |
-| SSH 远程终端 | ✓ 支持 | 依赖终端模拟器能力 |
-| FreeBSD/OpenBSD | ✓ 支持 | crossterm 支持 |
-
-crossterm 后端自动处理各平台差异（Windows API vs POSIX termios）。鼠标支持在所有现代终端模拟器中可用。Inline viewport 模式（`--height`）在所有支持 scroll region 的终端中可用。
 
 ## License
 

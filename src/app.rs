@@ -10,7 +10,9 @@ use crate::config::Config;
 use crate::input::{self, InputSource, SharedStore};
 use crate::keybind::{Action, KeyBindings};
 use crate::matcher::{FuzzyMatcher, SharedMatchState};
-use crate::preview::{PreviewRunner, SharedPreview};
+use crate::preview::{PreviewContent, PreviewRunner, SharedPreview};
+use crate::preview::resolver::PreviewResolver;
+use crate::theme::Theme;
 use crate::ui;
 
 pub struct AppState {
@@ -29,13 +31,20 @@ impl AppState {
         self.preview_state.is_some()
     }
 
-    pub fn get_preview_content(&self) -> (String, bool) {
+    pub fn preview_visible(&self) -> bool {
+        match &self.preview_state {
+            Some(ps) => ps.lock().visible,
+            None => false,
+        }
+    }
+
+    pub fn get_preview_content(&self) -> PreviewContent {
         match &self.preview_state {
             Some(ps) => {
                 let s = ps.lock();
-                (s.content.clone(), s.loading)
+                s.content.clone()
             }
-            None => (String::new(), false),
+            None => PreviewContent::Empty,
         }
     }
 }
@@ -45,13 +54,14 @@ pub struct App {
     matcher: FuzzyMatcher,
     keybindings: KeyBindings,
     preview_runner: Option<PreviewRunner>,
+    theme: Theme,
     last_item_count: usize,
     last_terminal_height: u16,
 }
 
 impl App {
     pub fn new(config: Config, source: InputSource) -> Self {
-        let store = input::start_reader(source)
+        let store = input::start_provider(source, config.provider_config)
             .expect("failed to start reader");
         let mut matcher = FuzzyMatcher::new(store.clone());
         let match_state = matcher.match_state();
@@ -59,7 +69,11 @@ impl App {
         matcher.update_query(&config.initial_query);
 
         let preview_runner = config.preview_cmd.as_ref().map(|cmd| {
-            PreviewRunner::new(cmd.clone())
+            let mut resolver = PreviewResolver::new(cmd.clone());
+            for rule in &config.preview_rules {
+                resolver.add_rule_from_config(rule);
+            }
+            PreviewRunner::new(resolver, config.preview_config.clone())
         });
         let preview_state = preview_runner.as_ref().map(|r| r.state());
 
@@ -79,6 +93,7 @@ impl App {
             matcher,
             keybindings: config.keybindings,
             preview_runner,
+            theme: config.theme,
             last_item_count: 0,
             last_terminal_height: 0,
         }
@@ -89,18 +104,17 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     ) -> io::Result<Option<Vec<String>>> {
         loop {
-            // Re-trigger match if new items arrived
             let current_count = self.state.store.read().len();
             if current_count != self.last_item_count {
                 self.last_item_count = current_count;
                 self.matcher.update_query(&self.state.query);
             }
 
+            let theme = self.theme.clone();
             terminal.draw(|f| {
                 let area = f.area();
-                // Track terminal height for scroll calculations
                 self.last_terminal_height = area.height;
-                ui::draw(f, &self.state);
+                ui::draw(f, &self.state, &theme);
             })?;
 
             if event::poll(Duration::from_millis(50))? {
@@ -121,7 +135,6 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Option<Vec<String>>> {
-        // First check configured keybindings
         if let Some(action) = self.keybindings.resolve(&key) {
             match action {
                 Action::Confirm => {
@@ -175,12 +188,34 @@ impl App {
                 }
                 Action::ScrollUp => { self.scroll_up(1); }
                 Action::ScrollDown => { self.scroll_down(1); }
+                Action::TogglePreview => {
+                    if let Some(ref runner) = self.preview_runner {
+                        runner.toggle_visible();
+                    }
+                }
+                Action::RefreshPreview => {
+                    if let Some(ref runner) = self.preview_runner {
+                        runner.refresh();
+                    }
+                }
+                Action::CursorHome => {
+                    self.state.cursor_pos = 0;
+                    self.state.scroll_offset = 0;
+                    self.request_preview();
+                }
+                Action::CursorEnd => {
+                    let total = self.state.match_state.read().results.len();
+                    if total > 0 {
+                        self.state.cursor_pos = total - 1;
+                        self.ensure_visible();
+                        self.request_preview();
+                    }
+                }
                 _ => {}
             }
             return None;
         }
 
-        // Unbound keys: treat printable chars as query input
         if let crossterm::event::KeyCode::Char(c) = key.code {
             if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT {
                 self.state.query.push(c);
@@ -206,7 +241,6 @@ impl App {
     }
 
     fn visible_height(&self) -> usize {
-        // Approximate: total height minus input(3) and status(1)
         (self.last_terminal_height as usize).saturating_sub(4).max(1)
     }
 

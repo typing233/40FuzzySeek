@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -7,11 +7,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::AppState;
 use crate::matcher::MatchResult;
+use crate::preview::PreviewContent;
+use crate::theme::Theme;
 
-pub fn draw(f: &mut Frame, state: &AppState) {
+pub fn draw(f: &mut Frame, state: &AppState, theme: &Theme) {
     let area = f.area();
 
-    let main_chunks = if state.has_preview() {
+    let show_preview = state.has_preview() && state.preview_visible();
+
+    let main_chunks = if show_preview {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -29,34 +33,34 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
         .split(left_area);
 
-    draw_input(f, state, left_chunks[0]);
-    draw_list(f, state, left_chunks[1]);
-    draw_status(f, state, left_chunks[2]);
+    draw_input(f, state, left_chunks[0], theme);
+    draw_list(f, state, left_chunks[1], theme);
+    draw_status(f, state, left_chunks[2], theme);
 
-    if state.has_preview() && main_chunks.len() > 1 {
-        draw_preview(f, state, main_chunks[1]);
+    if show_preview && main_chunks.len() > 1 {
+        draw_preview(f, state, main_chunks[1], theme);
     }
 }
 
-fn draw_input(f: &mut Frame, state: &AppState, area: Rect) {
+fn draw_input(f: &mut Frame, state: &AppState, area: Rect, theme: &Theme) {
     let input_block = Block::default()
         .borders(Borders::ALL)
+        .border_style(theme.border)
         .title(" Query ");
 
     let input = Paragraph::new(state.query.as_str())
         .block(input_block)
-        .style(Style::default().fg(Color::White));
+        .style(theme.input);
 
     f.render_widget(input, area);
 
-    // Use unicode display width for correct cursor positioning with CJK chars
     let visual_width = UnicodeWidthStr::width(state.query.as_str()) as u16;
     let cursor_x = area.x + 1 + visual_width;
     let cursor_y = area.y + 1;
     f.set_cursor_position((cursor_x.min(area.x + area.width - 2), cursor_y));
 }
 
-fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
+fn draw_list(f: &mut Frame, state: &AppState, area: Rect, theme: &Theme) {
     let visible_height = area.height as usize;
     let match_state = state.match_state.read();
     let results = &match_state.results;
@@ -76,7 +80,7 @@ fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
 
             let line_text = store.get(m.index).map(|s| s.as_ref()).unwrap_or("");
 
-            let spans = build_highlighted_line(line_text, m, is_cursor, is_selected, state.multi_select);
+            let spans = build_highlighted_line(line_text, m, is_cursor, is_selected, state.multi_select, theme);
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -88,7 +92,7 @@ fn draw_list(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
+fn draw_status(f: &mut Frame, state: &AppState, area: Rect, theme: &Theme) {
     let match_state = state.match_state.read();
     let store = state.store.read();
 
@@ -105,36 +109,39 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let status_line = Paragraph::new(format!("{}{}", status, multi_hint))
-        .style(Style::default().fg(Color::DarkGray));
+        .style(theme.status);
 
     f.render_widget(status_line, area);
 }
 
-fn draw_preview(f: &mut Frame, state: &AppState, area: Rect) {
+fn draw_preview(f: &mut Frame, state: &AppState, area: Rect, theme: &Theme) {
     let preview_block = Block::default()
         .borders(Borders::ALL)
+        .border_style(theme.preview_border)
         .title(" Preview ");
 
-    let (content, loading) = state.get_preview_content();
-    let display = if loading { "Loading...".to_string() } else { content };
+    let (content, display_text) = match state.get_preview_content() {
+        PreviewContent::Loading => (theme.loading, "Loading...".to_string()),
+        PreviewContent::Empty => (theme.preview_text, String::new()),
+        PreviewContent::Text(text) => (theme.preview_text, text),
+        PreviewContent::Error(err) => (theme.error, format!("Error: {}", err)),
+    };
 
-    let paragraph = Paragraph::new(display)
+    let paragraph = Paragraph::new(display_text)
         .block(preview_block)
         .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::White));
+        .style(content);
 
     f.render_widget(paragraph, area);
 }
 
-/// Build highlighted spans from a candidate line.
-/// ANSI codes are stripped before indexing/highlighting to avoid layout corruption.
-/// Characters are indexed after stripping so highlight positions stay correct.
 fn build_highlighted_line(
     raw_text: &str,
     match_result: &MatchResult,
     is_cursor: bool,
     is_selected: bool,
     multi_select: bool,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -147,16 +154,15 @@ fn build_highlighted_line(
     };
 
     let prefix_style = if is_cursor {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        theme.cursor
     } else if is_selected {
-        Style::default().fg(Color::Green)
+        theme.multi_indicator
     } else {
         Style::default()
     };
 
     spans.push(Span::styled(prefix.to_string(), prefix_style));
 
-    // Strip ANSI escapes for safe character indexing
     let stripped_bytes = strip_ansi_escapes::strip(raw_text);
     let stripped = String::from_utf8_lossy(&stripped_bytes);
 
@@ -164,14 +170,12 @@ fn build_highlighted_line(
         match_result.positions.iter().copied().collect();
 
     let base_style = if is_cursor {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        theme.text_bold
     } else {
-        Style::default().fg(Color::White)
+        theme.text
     };
 
-    let highlight_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let highlight_style = theme.highlight;
 
     let mut char_idx: u32 = 0;
     let mut current_run = String::new();

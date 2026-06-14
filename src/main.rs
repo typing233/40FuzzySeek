@@ -4,6 +4,7 @@ mod input;
 mod keybind;
 mod matcher;
 mod preview;
+mod theme;
 mod ui;
 
 use std::io::{self, IsTerminal, Write};
@@ -24,20 +25,32 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use app::App;
 use config::Config;
 
+const SHELL_BASH: &str = include_str!("../shell/fuzzyseek.bash");
+const SHELL_ZSH: &str = include_str!("../shell/fuzzyseek.zsh");
+const SHELL_FISH: &str = include_str!("../shell/fuzzyseek.fish");
+
 #[derive(Parser, Debug)]
 #[command(name = "fuzzyseek", version, about = "High-performance fuzzy finder for millions of lines")]
-struct Cli {
+pub struct Cli {
     /// Input file (reads from stdin if not provided)
     #[arg(short, long)]
     file: Option<String>,
 
-    /// Enable multi-select mode (Tab to toggle)
+    /// Command to execute for input (alternative to pipe/file)
+    #[arg(long)]
+    cmd: Option<String>,
+
+    /// Enable multi-select mode (Tab/Ctrl+Space to toggle)
     #[arg(short, long)]
     multi: bool,
 
     /// Preview command (use {} as placeholder for the line)
     #[arg(short, long)]
     preview: Option<String>,
+
+    /// Preview timeout in milliseconds
+    #[arg(long, default_value = "5000")]
+    preview_timeout: u64,
 
     /// Initial query
     #[arg(short, long, default_value = "")]
@@ -54,11 +67,39 @@ struct Cli {
     /// Key bindings (format: action:key, e.g. "confirm:ctrl-m,cancel:ctrl-g")
     #[arg(long)]
     bind: Vec<String>,
+
+    /// Theme name ("dark" or "light")
+    #[arg(long)]
+    theme: Option<String>,
+
+    /// Maximum number of items to read (OOM protection)
+    #[arg(long)]
+    max_items: Option<usize>,
+
+    /// Print shell integration script and exit (bash, zsh, fish)
+    #[arg(long, value_name = "SHELL")]
+    shell_integration: Option<String>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = match Config::from_cli(&cli) {
+
+    // Handle --shell-integration: print script and exit
+    if let Some(ref shell_name) = cli.shell_integration {
+        let script = match shell_name.to_lowercase().as_str() {
+            "bash" => SHELL_BASH,
+            "zsh" => SHELL_ZSH,
+            "fish" => SHELL_FISH,
+            other => {
+                eprintln!("fuzzyseek: unsupported shell '{}' (use bash, zsh, or fish)", other);
+                return ExitCode::from(2);
+            }
+        };
+        print!("{}", script);
+        return ExitCode::SUCCESS;
+    }
+
+    let (config, conflicts) = match Config::from_cli(&cli) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("fuzzyseek: {}", e);
@@ -66,17 +107,22 @@ fn main() -> ExitCode {
         }
     };
 
-    let input_source = if let Some(ref path) = cli.file {
-        if !std::path::Path::new(path).exists() {
-            eprintln!("fuzzyseek: cannot open '{}': No such file or directory", path);
+    // Report bind conflicts as warnings
+    for conflict in &conflicts {
+        eprintln!(
+            "fuzzyseek: warning: key '{}' reassigned from {:?} to {:?}",
+            conflict.key.display(),
+            conflict.displaced_action,
+            conflict.new_action
+        );
+    }
+
+    let input_source = match Config::determine_input_source(&cli) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fuzzyseek: {}", e);
             return ExitCode::from(2);
         }
-        input::InputSource::File(path.clone())
-    } else if !io::stdin().is_terminal() {
-        input::InputSource::Stdin
-    } else {
-        eprintln!("fuzzyseek: no input (provide --file or pipe data via stdin)");
-        return ExitCode::from(2);
     };
 
     let is_inline = config.height > 0;
@@ -132,13 +178,13 @@ fn main() -> ExitCode {
         }
     };
 
+    let delimiter = cli.delimiter.clone();
     let mut app = App::new(config, input_source);
     let result = app.run(&mut terminal);
 
     let _ = disable_raw_mode();
     if is_inline {
         let _ = execute!(io::stderr(), DisableMouseCapture, cursor::Show);
-        // Insert newline to move below the inline viewport
         let _ = execute!(io::stderr(), cursor::MoveToNextLine(1));
     } else {
         let _ = execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture);
@@ -146,7 +192,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok(Some(selections)) => {
-            let output = selections.join(&cli.delimiter);
+            let output = selections.join(&delimiter);
             print!("{}", output);
             io::stdout().flush().ok();
             ExitCode::SUCCESS
